@@ -1,0 +1,365 @@
+diff --git a/includes/uuid_node.features.inc b/includes/uuid_node.features.inc
+index 542e115..98b5653 100644
+--- a/includes/uuid_node.features.inc
++++ b/includes/uuid_node.features.inc
+@@ -90,6 +90,7 @@ function uuid_node_features_export_render($module, $data) {
+     unset($export->vid);
+     unset($export->revision_timestamp);
+     unset($export->changed);
++    unset($export->last_comment_timestamp);
+ 
+     // The hook_alter signature is:
+     // hook_uuid_node_features_export_render_alter(&$export, $node, $module);
+diff --git a/includes/uuid_term.features.inc b/includes/uuid_term.features.inc
+index a1b4d5b..94bba29 100644
+--- a/includes/uuid_term.features.inc
++++ b/includes/uuid_term.features.inc
+@@ -26,32 +26,52 @@ function uuid_term_features_export_options() {
+  * Implements hook_features_export().
+  */
+ function uuid_term_features_export($data, &$export, $module_name = '') {
+-  $pipe = array();
+-
+   $export['dependencies']['taxonomy'] = 'taxonomy';
+   $export['dependencies']['uuid'] = 'uuid';
+   $export['dependencies']['uuid_features'] = 'uuid_features';
+ 
+   foreach ($data as $uuid) {
+-    $export['features']['uuid_term'][$uuid] = $uuid;
+-
+-    // Get the machine name of the term's vocabulary.
+-    $voc_machine_name = db_query('SELECT v.machine_name FROM {taxonomy_vocabulary} v
+-      INNER JOIN {taxonomy_term_data} t ON t.vid = v.vid
+-      WHERE t.uuid = :uuid', array(':uuid' => $uuid))->fetchField();
+-
+-    // Add the vocab UUID to the pipe, to be processed by uuid_vocabulary.
+-    $export['features']['uuid_vocabulary'][$voc_machine_name] = $voc_machine_name;
++    uuid_term_features_get_dependencies($export, $uuid);
++  }
++  return array();
++}
+ 
+-    // Get the UUID of the term's parents.
+-    $tid = uuid_taxonomy_term_find($uuid);
+-    $parents = taxonomy_get_parents($tid);
+-    foreach ($parents as $parent) {
+-      $export['features']['uuid_term'][$parent->uuid] = $parent->uuid;
++/**
++ * Adds terms and its dependencies to the export.
++ *
++ * Parents and term references are handled recrusively, other references are not
++ * yet supported.
++ */
++function uuid_term_features_get_dependencies(&$export, $uuid) {
++  $terms = entity_uuid_load('taxonomy_term', array($uuid));
++  if (count($terms)) {
++    $term = reset($terms);
++    $export['features']['uuid_term'][$uuid] = $uuid;
++    $export['features']['taxonomy'][$term->vocabulary_machine_name] = $term->vocabulary_machine_name;
++    // Recursively add all parents and the references of the parents.
++    foreach (taxonomy_get_parents($term->tid) as $parent) {
++      if (!in_array($parent->uuid, $export['features']['uuid_term'])) {
++        uuid_term_features_get_dependencies($export, $parent->uuid);
++      }
++    }
++    // Get term references.
++    $instances = field_info_instances('taxonomy_term', $term->vocabulary_machine_name);
++    foreach ($instances as $field_name => $instance) {
++      $field = field_info_field($field_name);
++      if ($field['type'] == 'taxonomy_term_reference') {
++        if (isset($term->$field_name)) {
++          foreach ($term->$field_name as $lang => $values) {
++            foreach ($values as $value) {
++              // $value['tid'] already contains the UUID.
++              if (!in_array($value['tid'], $export['features']['uuid_term'])) {
++                uuid_term_features_get_dependencies($export, $value['tid']);
++              }
++            }
++          }
++        }
++      }
+     }
+   }
+-
+-  return $pipe;
+ }
+ 
+ /**
+@@ -63,36 +83,18 @@ function uuid_term_features_export_render($module = 'foo', $data) {
+   $code[] = '  $terms = array();';
+   $code[] = '';
+   foreach ($data as $uuid) {
+-    $tid = uuid_taxonomy_term_find($uuid);
+-    $term = taxonomy_term_load($tid);
+-    if (!$term) {
++    // @todo reset = TRUE as otherwise references (parent, fields) were destroyed.
++    $terms = entity_uuid_load('taxonomy_term', array($uuid), array(), TRUE);
++    if (!count($terms)) {
+       continue;
+     }
++    $export = reset($terms);
+ 
+-    $export = array('uuid' => $uuid);
+-
+-    // Whitelist of term properties.
+-    $props = array('name', 'description', 'weight');
+-    foreach ($props as $key) {
+-      if (isset($term->$key)) {
+-        $export[$key] = $term->$key;
+-      }
+-    }
+-
+-    // Get the UUID of the term's parent terms.
+-    $parents = taxonomy_get_parents($tid);
+-    foreach ($parents as $parent) {
+-      $export['parent'][] = $parent->uuid;
+-    }
+-
+-    // Get the machine name of the term's vocabulary.
+-    /*$voc_machine_name = db_query('SELECT v.machine_name FROM {taxonomy_vocabulary} v
+-      INNER JOIN {taxonomy_term_data} t ON t.vid = v.vid
+-      WHERE t.vid = :vid', array(':vid' => $term->vid))->fetchField();*/
+-    $vocabularies = taxonomy_vocabulary_load_multiple(array($term->vid));
+-
+-    $export['uuid_vocabulary'] = $vocabularies[$term->vid]->machine_name;
+-
++    // Do not export ids.
++    unset($export->vid);
++    unset($export->tid);
++    // No need to export the rdf mapping.
++    unset($export->rdf_mapping);
+     $code[] = '  $terms[] = ' . features_var_export($export, '  ') . ';';
+   }
+ 
+@@ -117,31 +119,34 @@ function uuid_term_features_revert($module) {
+  * Rebuilds terms based on UUID from code defaults.
+  */
+ function uuid_term_features_rebuild($module) {
++  // Import the vocabularies first.
++  taxonomy_features_rebuild($module);
++
+   $terms = module_invoke($module, 'uuid_features_default_terms');
+   if (!empty($terms)) {
++    // Verify that term objects is saved before any references are resolved.
+     foreach ($terms as $data) {
+-      $existing = uuid_taxonomy_term_find($data['uuid']);
+-
+-      if (!empty($existing)) {
+-        $data['tid'] = $existing;
++      $existing = entity_get_id_by_uuid('taxonomy_term', array($data['uuid']));
++      if (!count($existing)) {
++        $voc = taxonomy_vocabulary_machine_name_load($data['vocabulary_machine_name']);
++        // Only save the term, if the corresponding vocabulary already exisits.
++        if ($voc) {
++          $term = new stdClass;
++          $term->uuid = $data['uuid'];
++          $term->vid = $voc->vid;
++          $term->name = $data['name'];
++          taxonomy_term_save($term);
++        } 
+       }
+-
+-      $vid = db_query('SELECT vid FROM {taxonomy_vocabulary} WHERE machine_name = :machine_name', array(':machine_name' => $data['uuid_vocabulary']))->fetchField();
+-      if ($vid) {
+-        $data['vid'] = $vid;
+-
+-        if (isset($data['parent']) && is_array($data['parent'])) {
+-          foreach ($data['parent'] as $key => $parent_uuid) {
+-            $data['parent'][$key] = uuid_taxonomy_term_find($parent_uuid);
+-          }
+-        }
+-
+-        $ret = taxonomy_term_save($term /* TODO Term object replaces array $data */);
+-
+-        // TODO: remove when http://drupal.org/node/860442 is resolved.
+-        uuid_set_uuid('taxonomy_term_data', 'tid', $data['tid'], $data['uuid']);
++    }
++    // Save all other data and resolve references.
++    foreach ($terms as $data) {
++      $term = (object) $data;
++      $voc = taxonomy_vocabulary_machine_name_load($term->vocabulary_machine_name);
++      if ($voc) {
++        $term->vid = $voc->vid;
++        entity_uuid_save('taxonomy_term', $term);
+       }
+-
+     }
+   }
+ }
+diff --git a/includes/uuid_vocabulary.features.inc b/includes/uuid_vocabulary.features.inc
+deleted file mode 100644
+index b95f20d..0000000
+--- a/includes/uuid_vocabulary.features.inc
++++ /dev/null
+@@ -1,111 +0,0 @@
+-<?php
+-/**
+- * @file
+- * Features hooks for the uuid_vocabulary features component.
+- */
+-
+-/**
+- * Implements hook_features_export_options().
+- */
+-function uuid_vocabulary_features_export_options() {
+-  $options = array();
+-
+-  $vocabularies = taxonomy_get_vocabularies();
+-  foreach ($vocabularies as $vocab) {
+-    $options[$vocab->machine_name] = $vocab->name;
+-  }
+-
+-  return $options;
+-}
+-
+-/**
+- * Implements hook_features_export().
+- */
+-function uuid_vocabulary_features_export($data, &$export, $module_name = '') {
+-  $pipe = array();
+-
+-  $export['dependencies']['taxonomy'] = 'taxonomy';
+-  $export['dependencies']['uuid'] = 'uuid';
+-  $export['dependencies']['uuid_features'] = 'uuid_features';
+-
+-  foreach ($data as $uuid) {
+-    $export['features']['uuid_vocabulary'][$uuid] = $uuid;
+-  }
+-
+-  return $pipe;
+-}
+-
+-/**
+- * Implements hook_features_export_render().
+- */
+-function uuid_vocabulary_features_export_render($module = 'foo', $data) {
+-  $translatables = $code = array();
+-
+-  $code[] = '  $vocabularies = array();';
+-  $code[] = '';
+-  foreach ($data as $uuid) {
+-    $vocab = taxonomy_vocabulary_machine_name_load($uuid);
+-
+-    if (!$vocab) {
+-      continue;
+-    }
+-
+-    $export = array('uuid' => $uuid);
+-
+-    // Whitelist of vocabulary properties.
+-    $props = array(
+-      'name',
+-      'description',
+-      'help',
+-      'relations',
+-      'heirarchy',
+-      'multiple',
+-      'required',
+-      'tags',
+-      'module',
+-      'weight',
+-      'nodes',
+-    );
+-    foreach ($props as $key) {
+-      if (isset($vocab->$key)) {
+-        $export[$key] = $vocab->$key;
+-      }
+-    }
+-
+-    $code[] = '  $vocabularies[] = ' . features_var_export($export, '  ') . ';';
+-  }
+-
+-  if (!empty($translatables)) {
+-    $code[] = features_translatables_export($translatables, '  ');
+-  }
+-
+-  $code[] = '  return $vocabularies;';
+-  $code = implode("\n", $code);
+-  return array('uuid_features_default_vocabularies' => $code);
+-}
+-
+-/**
+- * Implements hook_features_revert().
+- */
+-function uuid_vocabulary_features_revert($module) {
+-  uuid_vocabulary_features_rebuild($module);
+-}
+-
+-/**
+- * Implements hook_features_rebuild().
+- * Rebuilds nodes based on UUID from code defaults.
+- */
+-function uuid_vocabulary_features_rebuild($module) {
+-  $vocabs = module_invoke($module, 'uuid_features_default_vocabularies');
+-  if (!empty($vocabs)) {
+-    foreach ($vocabs as $vocab) {
+-      $vocabulary = taxonomy_vocabulary_machine_name_load($vocab->machine_name);
+-
+-      if (!empty($vocabulary)) {
+-        $vocab->vid = $vocabulary->vid;
+-      }
+-
+-      taxonomy_vocabulary_save($vocab);
+-    }
+-  }
+-}
+diff --git a/uuid_features.info b/uuid_features.info
+index 423b052..5da286b 100644
+--- a/uuid_features.info
++++ b/uuid_features.info
+@@ -3,6 +3,7 @@ description = Provides features integration for content (nodes, taxonomy, etc) b
+ core = 7.x
+ dependencies[] = features
+ dependencies[] = uuid
++dependencies[] = entity
+ package = Features
+ 
+ files[] = uuid_features.install
+diff --git a/uuid_features.module b/uuid_features.module
+index fc49eed..0e5c038 100644
+--- a/uuid_features.module
++++ b/uuid_features.module
+@@ -6,29 +6,20 @@
+ function uuid_features_features_api() {
+   $components = array();
+ 
+-  if (module_exists('uuid_node')) {
+-    $components['uuid_node'] = array(
+-      'name' => t('Content'),
+-      'features_source' => TRUE,
+-      'default_hook' => 'uuid_features_default_content',
+-      'default_file' => FEATURES_DEFAULTS_INCLUDED,
+-      'file' => drupal_get_path('module', 'uuid_features') . '/includes/uuid_node.features.inc',
+-    );
+-  }
+-  if (module_exists('uuid_taxonomy')) {
+-    $components['uuid_vocabulary'] = array(
+-      'name' => t('Vocabulary'),
+-      'default_hook' => 'uuid_features_default_vocabularies',
+-      'default_file' => FEATURES_DEFAULTS_INCLUDED,
+-      'file' => drupal_get_path('module', 'uuid_features') . '/includes/uuid_vocabulary.features.inc',
+-    );
+-    $components['uuid_term'] = array(
+-      'name' => t('Taxonomy Term'),
+-      'default_hook' => 'uuid_features_default_terms',
+-      'default_file' => FEATURES_DEFAULTS_INCLUDED,
+-      'file' => drupal_get_path('module', 'uuid_features') . '/includes/uuid_term.features.inc',
+-    );
+-  }
++  $components['uuid_node'] = array(
++    'name' => t('Content'),
++    'features_source' => TRUE,
++    'default_hook' => 'uuid_features_default_content',
++    'default_file' => FEATURES_DEFAULTS_INCLUDED,
++    'file' => drupal_get_path('module', 'uuid_features') . '/includes/uuid_node.features.inc',
++  );
++
++  $components['uuid_term'] = array(
++    'name' => t('Taxonomy Term'),
++    'default_hook' => 'uuid_features_default_terms',
++    'default_file' => FEATURES_DEFAULTS_INCLUDED,
++    'file' => drupal_get_path('module', 'uuid_features') . '/includes/uuid_term.features.inc',
++  );
+ 
+   // Depends on http://drupal.org/node/808690
+   if (function_exists('uuid_file_insert')) {
